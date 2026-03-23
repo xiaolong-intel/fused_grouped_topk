@@ -7,7 +7,7 @@ export https_proxy=http://child-prc.intel.com:913
 export no_proxy=localhost,127.0.0.1,10.0.0.0/8,.intel.com
 ```
 # Download vllm-xpu-kernels
-git clone https://github.com/vllm-project/vllm-xpu-kernels.git
+git clone https://github.com/vllm-project/vllm-xpu-kernels.git  
 cp csrc/grouped_topk_kernels.cpp vllm-xpu-kernels/csrc/moe/
 # Install
 pip install -vv -e . --no-build-isolation
