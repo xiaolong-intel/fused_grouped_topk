@@ -1,0 +1,66 @@
+#include <Python.h>
+#include <torch/all.h>
+#include <torch/library.h>
+
+#include "../vllm-xpu-kernels/csrc/moe/fused_grouped_topk.cpp"
+#include "../vllm-xpu-kernels/csrc/moe/grouped_topk_kernels.cpp"
+namespace {
+
+std::tuple<torch::Tensor, torch::Tensor> fused_grouped_topk_xpu(
+    const torch::Tensor& hidden_states,
+    const torch::Tensor& gating_output,
+    int64_t n_topk,
+    bool renormalize,
+    int64_t n_expert_group,
+    int64_t n_topk_group,
+    const std::string& scoring_func,
+    double routed_scaling_factor,
+    const c10::optional<torch::Tensor>& bias) {
+  return fused_grouped_topk(hidden_states, gating_output, n_topk, renormalize,
+                            n_expert_group, n_topk_group, scoring_func,
+                            routed_scaling_factor, bias);
+}
+
+std::tuple<torch::Tensor, torch::Tensor> grouped_topk_xpu(
+    const torch::Tensor& scores,
+    int64_t n_group,
+    int64_t topk_group,
+    int64_t topk,
+    bool renormalize,
+    double routed_scaling_factor,
+    const torch::Tensor& bias,
+    int64_t scoring_func) {
+  return grouped_topk(scores, n_group, topk_group, topk,
+                                      renormalize, routed_scaling_factor, bias,
+                                      scoring_func);
+}
+
+}  // namespace
+
+TORCH_LIBRARY(sycl_fused_grouped_topk, m) {
+  m.def(
+      "fused_grouped_topk(Tensor hidden_states, Tensor gating_output, int n_topk, bool renormalize, int n_expert_group, int n_topk_group, str scoring_func, float routed_scaling_factor, Tensor? bias=None) -> (Tensor, Tensor)");
+  m.def(
+      "grouped_topk(Tensor scores, int n_group, int topk_group, int topk, bool renormalize, float routed_scaling_factor, Tensor bias, int scoring_func) -> (Tensor, Tensor)");
+}
+
+TORCH_LIBRARY_IMPL(sycl_fused_grouped_topk, XPU, m) {
+  m.impl("fused_grouped_topk", &fused_grouped_topk_xpu);
+  m.impl("grouped_topk", &grouped_topk_xpu);
+}
+
+extern "C" {
+#ifdef _WIN32
+__declspec(dllexport)
+#endif
+PyObject* PyInit__C(void) {
+  static struct PyModuleDef moduledef = {
+      PyModuleDef_HEAD_INIT,
+      "_C",
+      "SYCL fused_grouped_topk shim",
+      -1,
+      NULL,
+  };
+  return PyModule_Create(&moduledef);
+}
+}

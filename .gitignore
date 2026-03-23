@@ -1,0 +1,5 @@
+
+# Build artifacts
+sycl_fused_grouped_topk/*.so
+sycl_fused_grouped_topk/*.pyd
+sycl_fused_grouped_topk/__pycache__/
