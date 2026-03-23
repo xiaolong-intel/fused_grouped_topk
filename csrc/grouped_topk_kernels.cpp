@@ -374,62 +374,96 @@ class WarpSelect : public WarpSort<capacity, greater, T, idxT, is_stable> {
 
 namespace reduce_topk {
 
+// Convert float bits to an order-preserving uint32 (equivalent to
+// cub::Traits<float>::TwiddleIn from the CUDA reference).
+// Positive floats (sign bit=0, bits in [0x00000000,0x7FFFFFFF]):
+//   set sign bit via XOR → [0x80000000, 0xFFFFFFFF], preserving order.
+// Negative floats (sign bit=1, bits in [0x80000000,0xFFFFFFFF]):
+//   flip all bits via NOT → [0x00000000, 0x7FFFFFFF], reversing the
+//   negated-magnitude order back to ascending order.
+// Result: all floats map to uint32 values where larger uint32 = larger float.
+inline uint32_t floatTwiddleIn(float val) {
+    uint32_t bits = sycl::bit_cast<uint32_t>(val);
+    return (bits >> 31) ? ~bits : (bits ^ 0x80000000u);
+}
+
+// Inverse of floatTwiddleIn
+inline float floatTwiddleOut(uint32_t bits) {
+    if (bits >> 31) {
+        return sycl::bit_cast<float>(bits ^ 0x80000000u);
+    } else {
+        return sycl::bit_cast<float>(~bits);
+    }
+}
+
+// Pack (float val, int32_t idx) into a uint64_t for max-reduction comparison.
+// Higher packed value = better candidate (higher val; ties broken by lower idx).
+// Encoding: high 32 bits = twiddled float bits; low 16 bits = (kMaxIdx - idx).
+// kMaxIdx must fit in 16 bits (the lower 16 bits of the packed uint64_t encode
+// (kMaxIdx - idx), so idx must be in [0, kMaxIdx]).  65535 = (1<<16) - 1.
+static constexpr int32_t kMaxIdx = 65535;
+static constexpr int kMoveBits = 32;
+
+inline uint64_t packValIdx(float val, int32_t idx) {
+    uint64_t twiddled = floatTwiddleIn(val);
+    return (twiddled << kMoveBits) | static_cast<uint64_t>(kMaxIdx - idx);
+}
+
+// Unpack a packed uint64_t back to (val, idx).
+inline void unpackValIdx(uint64_t packed, float& val, int32_t& idx) {
+    idx = kMaxIdx - static_cast<int32_t>(packed & 0xFFFF);
+    val = floatTwiddleOut(static_cast<uint32_t>(packed >> kMoveBits));
+}
+
+// Ported from the CUDA TopKRedType in moeTopKFuncs.cuh.
+// Uses a single packed max-reduction so that value and index are selected
+// atomically, avoiding the two-step (value reduce + index reduce) race.
 template <int N_IN, typename T, typename IdxT>
 inline void reduceTopK(sycl::sub_group subgroup, T* out_val, IdxT* out_idx,
                        const T* in_vals, const IdxT* in_idxs, T min_val,
                        int topk) {
-    constexpr IdxT invalid_idx = std::numeric_limits<IdxT>::max();
-    bool selected[N_IN] = {false};
+    float min_f = sycl_cast<float, T>(min_val);
+
+    // Pack each candidate; candidates equal to min_val are invalid (packed = 0).
+    uint64_t packed[N_IN];
+    #pragma unroll
+    for (int i = 0; i < N_IN; ++i) {
+        float f = sycl_cast<float, T>(in_vals[i]);
+        packed[i] = (f > min_f)
+                        ? packValIdx(f, static_cast<int32_t>(in_idxs[i]))
+                        : 0;
+    }
 
     for (int k = 0; k < topk; ++k) {
-        T local_best_val = min_val;
-        IdxT local_best_idx = invalid_idx;
+        // Find this lane's best non-used candidate (0 = used or invalid).
+        uint64_t local_best = 0;
         int local_best_pos = -1;
-
         #pragma unroll
         for (int i = 0; i < N_IN; ++i) {
-            if (selected[i]) {
-                continue;
-            }
-            T cand_val = in_vals[i];
-            IdxT cand_idx = in_idxs[i];
-            if ((cand_val > local_best_val) ||
-                ((cand_val == local_best_val) && (cand_idx < local_best_idx))) {
-                local_best_val = cand_val;
-                local_best_idx = cand_idx;
+            if (packed[i] > local_best) {
+                local_best = packed[i];
                 local_best_pos = i;
             }
         }
 
-        T warp_best_val = sycl::reduce_over_group(
-            subgroup, local_best_val, sycl::maximum<T>());
+        // Single packed reduce: atomically selects best (value, index) across warp.
+        uint64_t warp_best = sycl::reduce_over_group(
+            subgroup, local_best, sycl::maximum<uint64_t>());
 
-        IdxT warp_best_idx = invalid_idx;
-        if (local_best_pos != -1 && local_best_val == warp_best_val) {
-            warp_best_idx = local_best_idx;
-        }
-        warp_best_idx = sycl::reduce_over_group(
-            subgroup, warp_best_idx, sycl::minimum<IdxT>());
-
-        bool found = (warp_best_idx != invalid_idx);
-        if (found) {
-            int insert_pos = k;
-            while (insert_pos > 0 && out_val[insert_pos - 1] == warp_best_val &&
-                   out_idx[insert_pos - 1] > warp_best_idx) {
-                out_val[insert_pos] = out_val[insert_pos - 1];
-                out_idx[insert_pos] = out_idx[insert_pos - 1];
-                --insert_pos;
-            }
-            out_val[insert_pos] = warp_best_val;
-            out_idx[insert_pos] = warp_best_idx;
+        if (warp_best > 0) {
+            float best_f;
+            int32_t best_idx;
+            unpackValIdx(warp_best, best_f, best_idx);
+            out_val[k] = sycl_cast<T, float>(best_f);
+            out_idx[k] = static_cast<IdxT>(best_idx);
         } else {
             out_val[k] = min_val;
             out_idx[k] = 0;
         }
 
-        if (found && local_best_pos != -1 && local_best_val == warp_best_val &&
-            local_best_idx == warp_best_idx) {
-            selected[local_best_pos] = true;
+        // Dedup: the lane that owns the winning candidate marks it as used.
+        if (local_best_pos != -1 && local_best == warp_best) {
+            packed[local_best_pos] = 0;
         }
     }
 }
@@ -439,8 +473,7 @@ inline void reduceTopK(sycl::sub_group subgroup, T* out_val, IdxT* out_idx,
                        T val, IdxT idx, T min_val, int topk) {
     T in_vals[1] = {val};
     IdxT in_idxs[1] = {idx};
-    reduceTopK<1>(subgroup, out_val, out_idx, in_vals, in_idxs, min_val,
-                  topk);
+    reduceTopK<1>(subgroup, out_val, out_idx, in_vals, in_idxs, min_val, topk);
 }
 
 }  // namespace reduce_topk
@@ -471,8 +504,9 @@ inline bool is_finite(const T val) {
 }
 
 inline float sigmoid_accurate(float x) {
-    //return 0.5f * sycl::native::tanh(0.5f * x) + 0.5f;
-    return 1.f / (1.f + sycl::native::exp(-x)); // More efficient approximation Optimized point 1
+    // Use standard-precision sycl::tanh (not native:: or half_precision::) to
+    // match the CUDA reference: 0.5f * tanhf(0.5f * x) + 0.5f.
+    return 0.5f * sycl::tanh(0.5f * x) + 0.5f;
 }
 
 template <typename T>
