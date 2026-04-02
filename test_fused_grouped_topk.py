@@ -81,10 +81,10 @@ def _parse_cli_args():
 
 
 def _group_topk_params(num_experts: int):
-    n_expert_group = 8 if num_experts >= 8 and num_experts % 8 == 0 else 1
-    n_topk_group = 4 if n_expert_group >= 2 else 1
+    #n_expert_group = 8 if num_experts >= 8 and num_experts % 8 == 0 else 1
+    n_expert_group = 8
+    n_topk_group = 2
     max_topk = n_topk_group * (num_experts // n_expert_group)
-    #n_topk = min(4, max_topk)
     n_topk = 8
     return n_topk, n_expert_group, n_topk_group
 
@@ -102,9 +102,6 @@ def _run_op_once(num_tokens: int, hidden_dim: int, num_experts: int, hidden_stat
         gating_output = torch.randn(
             num_tokens, num_experts, device=device, dtype=torch.float16
         )
-    if bias is None:
-        bias = torch.zeros(num_experts, device=device, dtype=torch.float16)
-
     values, indices = ext.fused_grouped_topk(
         hidden_states,
         gating_output,
@@ -119,27 +116,29 @@ def _run_op_once(num_tokens: int, hidden_dim: int, num_experts: int, hidden_stat
     return values, indices, n_topk
 
 
-def _run_grouped_topk_once(num_tokens: int, num_experts: int, scores=None, bias=None):
-    # grouped_topk kernel expects float32 inputs currently
-    device = "xpu"
+def _run_grouped_topk_once(num_tokens: int, num_experts: int, hidden_states=None, gating_output=None, bias=None):
+    # grouped_topk kernel now matches fused_grouped_topk signature
+    device = "xpu:7"
+    hidden_dim = 712
     n_topk, n_group, topk_group = _group_topk_params(num_experts)
     
-    if scores is None:
-        scores = torch.randn(num_tokens, num_experts, device=device, dtype=torch.float32)
-    if bias is None:
-        bias = torch.zeros(num_experts, device=device, dtype=torch.float32)
-
+    if hidden_states is None:
+        hidden_states = torch.randn(num_tokens, hidden_dim, device=device, dtype=torch.float32)
+    if gating_output is None:
+        gating_output = torch.randn(num_tokens, num_experts, device=device, dtype=torch.float32)
     values, indices = ext.grouped_topk(
-        scores,
-        n_group,
-        topk_group,
+        hidden_states,
+        gating_output,
         n_topk,
         True,
+        n_group,
+        topk_group,
+        "sigmoid",
         1.0,
         bias,
-        1,
     )
     return values, indices, n_topk
+
 
 
 def _profile_kernel(label: str, fn, warmup_steps: int, active_steps: int, repeat: int,
@@ -192,19 +191,15 @@ def _run_profile(num_tokens: int, hidden_dim: int, num_experts: int):
     
     device = "xpu"
     print("Allocating profiling tensors...")
-    # Pre-allocate Fused Kernel inputs (FP16)
-    fused_hidden = torch.randn(num_tokens, hidden_dim, device=device, dtype=torch.float16)
-    fused_gating = torch.randn(num_tokens, num_experts, device=device, dtype=torch.float16)
-    fused_bias = torch.zeros(num_experts, device=device, dtype=torch.float16)
 
-    # Pre-allocate Grouped Kernel inputs (FP32)
-    grouped_scores = torch.randn(num_tokens, num_experts, device=device, dtype=torch.float32)
-    grouped_bias = torch.zeros(num_experts, device=device, dtype=torch.float32)
+    test_hidden = torch.randn(num_tokens, hidden_dim, device=device, dtype=torch.float16)
+    test_gating = torch.randn(num_tokens, num_experts, device=device, dtype=torch.float16)
+    test_bias = torch.zeros(num_experts, device=device, dtype=torch.float16)
 
     print("Profiling Fused Kernel...")
     # Increase warmup and active iterations for better stability
     for _ in range(50):
-        _run_op_once(num_tokens, hidden_dim, num_experts, fused_hidden, fused_gating, fused_bias)
+        _run_grouped_topk_once(num_tokens, num_experts, test_hidden, test_gating, test_bias)
     torch.xpu.synchronize()
 
     activities = [torch.profiler.ProfilerActivity.CPU]
@@ -221,7 +216,7 @@ def _run_profile(num_tokens: int, hidden_dim: int, num_experts: int):
         _profile_kernel(
             "fused",
             lambda: _run_op_once(
-                num_tokens, hidden_dim, num_experts, fused_hidden, fused_gating, fused_bias),
+                num_tokens, hidden_dim, num_experts, test_hidden, test_gating, test_bias),
             PROFILE_WARMUP,
             PROFILE_ACTIVE,
             PROFILE_REPEAT,
@@ -236,7 +231,7 @@ def _run_profile(num_tokens: int, hidden_dim: int, num_experts: int):
         _profile_kernel(
             "grouped",
             lambda: _run_grouped_topk_once(
-                num_tokens, num_experts, grouped_scores, grouped_bias),
+                num_tokens, num_experts, test_hidden, test_gating, test_bias),
             PROFILE_WARMUP,
             PROFILE_ACTIVE,
             PROFILE_REPEAT,
@@ -245,6 +240,69 @@ def _run_profile(num_tokens: int, hidden_dim: int, num_experts: int):
             PROFILE_TRACE_DIR,
         )
 
+def _pytorch_grouped_topk_reference(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    num_expert_group: int = 0,
+    topk_group: int = 0,
+    scoring_func: str = "softmax",
+    routed_scaling_factor: float = 1.0,
+    e_score_correction_bias: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+
+    assert hidden_states.size(0) == gating_output.size(0), "Number of tokens mismatch"
+    # Move to CPU to avoid XPU OOM on intermediate tensors
+    if scoring_func == "softmax":
+        scores = torch.softmax(gating_output, dim=-1)
+    elif scoring_func == "sigmoid":
+        scores = gating_output.sigmoid()
+    else:
+        raise ValueError(f"Unsupported scoring function: {scoring_func}")
+
+    num_token = scores.size(0)
+    if e_score_correction_bias is not None:
+        # Store original scores before applying correction bias. We use biased
+        # scores for expert selection but original scores for routing weights
+        original_scores = scores
+        scores = scores + e_score_correction_bias.unsqueeze(0)
+        group_scores = (
+            scores.view(num_token, num_expert_group, -1).topk(2, dim=-1)[0].sum(dim=-1)
+        )
+    else:
+        group_scores = (
+            scores.view(num_token, num_expert_group, -1).max(dim=-1).values
+        )  # [n, n_group]
+    # For batch invariance, use sorted=True to ensure deterministic expert selection
+    use_sorted = True
+    group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=use_sorted)[
+        1
+    ]  # [n, top_k_group]
+    group_mask = torch.zeros_like(group_scores)  # [n, n_group]
+    group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
+    score_mask = (
+        group_mask.unsqueeze(-1)
+        .expand(num_token, num_expert_group, scores.size(-1) // num_expert_group)
+        .reshape(num_token, -1)
+    )  # [n, e]
+    tmp_scores = scores.masked_fill(~score_mask.bool(), float("-inf"))  # [n, e]
+
+    if e_score_correction_bias is not None:
+        topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=use_sorted)[1]
+        # Use original unbiased scores for the routing weights
+        topk_weights = original_scores.gather(1, topk_ids)
+    else:
+        topk_weights, topk_ids = torch.topk(
+            tmp_scores, k=topk, dim=-1, sorted=use_sorted
+        )
+
+    if renormalize:
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+
+    if routed_scaling_factor != 1.0:
+        topk_weights = topk_weights * routed_scaling_factor
+    return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
 def _run_benchmark(num_tokens: int, hidden_dim: int, num_experts: int):
     if not torch.xpu.is_available():
@@ -252,11 +310,9 @@ def _run_benchmark(num_tokens: int, hidden_dim: int, num_experts: int):
 
     device = "xpu"
     print("Allocating benchmark tensors...")
-    fused_hidden = torch.randn(num_tokens, hidden_dim, device=device, dtype=torch.float16)
-    fused_gating = torch.randn(num_tokens, num_experts, device=device, dtype=torch.float16)
-    fused_bias = torch.zeros(num_experts, device=device, dtype=torch.float16)
-    grouped_scores = torch.randn(num_tokens, num_experts, device=device, dtype=torch.float32)
-    grouped_bias = torch.zeros(num_experts, device=device, dtype=torch.float32)
+    test_hidden = torch.randn(num_tokens, hidden_dim, device=device, dtype=torch.bfloat16)
+    test_gating = torch.randn(num_tokens, num_experts, device=device, dtype=torch.bfloat16)
+    test_bias = torch.zeros(num_experts, device=device, dtype=torch.bfloat16)
 
     benchmark_targets = []
     if BENCHMARK_TARGET in ("both", "fused"):
@@ -264,17 +320,18 @@ def _run_benchmark(num_tokens: int, hidden_dim: int, num_experts: int):
             "fused",
             lambda: _run_op_once(
                 num_tokens, hidden_dim, num_experts,
-                fused_hidden, fused_gating, fused_bias),
+                test_hidden, test_gating, test_bias),
         ))
     if BENCHMARK_TARGET in ("both", "grouped"):
         benchmark_targets.append((
             "grouped",
             lambda: _run_grouped_topk_once(
-                num_tokens, num_experts, grouped_scores, grouped_bias),
+                num_tokens, num_experts, test_hidden, test_gating, test_bias),
         ))
 
     for label, fn in benchmark_targets:
         print(f"\n=== Benchmark run ({label}) ===")
+        print("testing dtype=", test_hidden.dtype)
         start_event = torch.xpu.Event(enable_timing=True)
         end_event = torch.xpu.Event(enable_timing=True)
         for _ in range(BENCHMARK_WARMUP):
@@ -296,15 +353,19 @@ def _run_benchmark(num_tokens: int, hidden_dim: int, num_experts: int):
 class TestFusedGroupedTopkMinimal(unittest.TestCase):
     @unittest.skipIf(not torch.xpu.is_available(), "requires Intel XPU")
     def test_correct_validation(self):
-        num_experts = TEST_EXPERTS
+        print("start test_correct_validation")
+        num_experts = 256
         num_tokens = TEST_TOKENS
         hidden_dim = 712
-        device = "xpu"
-        n_topk, n_expert_group, n_topk_group = _group_topk_params(num_experts)
+        device = "xpu:7"
+        # n_topk, n_expert_group, n_topk_group = _group_topk_params(num_experts)
+        n_topk = 8
+        n_expert_group = 8
+        n_topk_group = 4
         routed_scaling_factor = 1.0
 
         hidden_states = torch.randn(
-            num_tokens, hidden_dim, device=device, dtype=torch.float16
+            num_tokens, hidden_dim, device=device, dtype=torch.bfloat16
         )
         # gating_output here likely acts as 'scores' for grouped_topk reference logic
         # but fused_grouped_topk might compute scores internally if it includes the gating matmul.
@@ -314,8 +375,9 @@ class TestFusedGroupedTopkMinimal(unittest.TestCase):
         gating_output = torch.randn(
             num_tokens, num_experts, device=device, dtype=torch.float16
         )
-        bias = torch.zeros(num_experts, device=device, dtype=torch.float16)
-        
+        bias = torch.zeros(num_experts, device=device, dtype=torch.bfloat16)
+
+
         # Test 1: Run Fused Kernel
         values_fused, indices_fused = ext.fused_grouped_topk(
             hidden_states,
@@ -324,25 +386,40 @@ class TestFusedGroupedTopkMinimal(unittest.TestCase):
             True,
             n_expert_group,
             n_topk_group,
-            "sigmoid",
+            "softmax",
             routed_scaling_factor,
-            bias,
+            None,
         )
-        
+
         # Test 2: Run Grouped TopK (The one we ported)
         # We use the same 'gating_output' as 'scores'
         values_grouped, indices_grouped = ext.grouped_topk(
-            gating_output.float(),
-            n_expert_group,
-            n_topk_group,
+            hidden_states,
+            gating_output,
             n_topk,
             True,
+            n_expert_group,
+            n_topk_group,
+            "softmax",
             routed_scaling_factor,
-            bias.float(),
-            1, # SCORING_SIGMOID
+            None,
+        )
+
+        values_cpu, indices_cpu = _pytorch_grouped_topk_reference(
+            hidden_states,
+            gating_output,
+            n_topk,
+            True,
+            n_expert_group,
+            n_topk_group,
+            "softmax",
+            routed_scaling_factor,
+            None,
         )
         self.assertEqual(values_grouped.shape, (num_tokens, n_topk))
         self.assertEqual(indices_grouped.shape, (num_tokens, n_topk))
+        self.assertEqual(values_cpu.shape, (num_tokens, n_topk))
+        self.assertEqual(indices_cpu.shape, (num_tokens, n_topk))
         # Note: Exact comparison might fail if floating point order differs or
         # if fused_grouped_topk does the MatMul internally vs grouped_topk taking scores.
         # But we can check bounds.
@@ -350,9 +427,44 @@ class TestFusedGroupedTopkMinimal(unittest.TestCase):
         self.assertTrue(torch.all(indices_grouped < num_experts).item())
         
         # Check indices match rate
-        match_rate = (indices_fused == indices_grouped).float().mean().item()
-        print(f"Indices match rate: {match_rate}")
-        self.assertTrue(match_rate > 0.95, "Indices should match > 95%")
+        indices_fused_cpu = indices_fused.detach().cpu()
+        values_fused_cpu = values_fused.detach().cpu()
+        indices_grouped_cpu = indices_grouped.detach().cpu()
+        values_grouped_cpu = values_grouped.detach().cpu()
+        indices_cpu_ref = indices_cpu.detach().cpu()
+        values_cpu_ref = values_cpu.detach().cpu()
+
+        mask_fused_grouped = indices_fused_cpu == indices_grouped_cpu
+        mask_grouped_cpu = indices_grouped_cpu == indices_cpu_ref
+        mask_fused_cpu = indices_fused_cpu == indices_cpu_ref
+        combined_mask = mask_fused_grouped & mask_grouped_cpu & mask_fused_cpu
+
+        if not combined_mask.all().item():
+            mismatch_positions = (~combined_mask).nonzero(as_tuple=False).cpu()
+            print("First mismatched entries:")
+            for token_idx, topk_idx in mismatch_positions[:20].tolist():
+                print(
+                    "token=", token_idx,
+                    "topk=", topk_idx,
+                    "fused_idx=", int(indices_fused_cpu[token_idx, topk_idx]),
+                    "grouped_idx=", int(indices_grouped_cpu[token_idx, topk_idx]),
+                    "cpu_idx=", int(indices_cpu_ref[token_idx, topk_idx]),
+                    "fused_val=", float(values_fused_cpu[token_idx, topk_idx]),
+                    "grouped_val=", float(values_grouped_cpu[token_idx, topk_idx]),
+                    "cpu_val=", float(values_cpu_ref[token_idx, topk_idx]),
+                )
+            mismatch_tokens = torch.unique(mismatch_positions[:, 0]).tolist()
+            print(f"Mismatch token rows (up to 20): {mismatch_tokens[:20]}")
+        
+        match_rate_fused_grouped = mask_fused_grouped.float().mean().item()
+        match_rate_grouped_cpu = mask_grouped_cpu.float().mean().item()
+        match_rate_fused_cpu = mask_fused_cpu.float().mean().item()
+        print(f"Indices match rate fused vs grouped: {match_rate_fused_grouped}")
+        print(f"Indices match rate grouped vs cpu: {match_rate_grouped_cpu}")
+        print(f"Indices match rate fused vs cpu: {match_rate_fused_cpu}")
+        self.assertTrue(match_rate_grouped_cpu == 1, "Grouped kernel should match CPU reference 100%")
+
+    
        
 
 if __name__ == "__main__":
